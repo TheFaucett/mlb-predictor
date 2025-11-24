@@ -2,10 +2,14 @@
    MLB Pitch Predictor
    Best Available Coordinates
    + Enhanced Context Engine (A3)
+   + Break Movement (HB / VB) Fallback
+   + CSV Arsenal Baselines
 ----------------------------- */
 
 import express from "express";
 import axios from "axios";
+import fs from "fs";
+import { parse } from "csv-parse/sync";
 
 const app = express();
 const PORT = 4000;
@@ -17,6 +21,9 @@ const GAME_ID = 745316; // regular-season game w/ Statcast
 const URL = `https://statsapi.mlb.com/api/v1.1/game/${GAME_ID}/feed/live`;
 const LIVE_POLL_RATE = 10000;
 const REPLAY_RATE = 5500;
+
+// path to your CSV (you can change this)
+const ARSENAL_CSV_PATH = "../pitch-arsenal-stats.csv";
 
 /* -----------------------------
    STATE
@@ -37,15 +44,17 @@ let simulatedOuts = 0;
 let simInning = null;
 let simHalf = null;
 
-// Coordinates cache: key → { px, pz, szTop, szBot }
+// Coordinates cache: key → { px, pz, szTop, szBot, hb?, vb?, angle?, length? }
 let pitchCoordCache = {};
 
-// NEW: pitcher & batter contextual stats
 // pitcherGameStats[pitcherId] = { fastball, breaking, change, total }
 let pitcherGameStats = {};
 
 // batterAggressionStats[batterId] = { swings, pitches }
 let batterAggressionStats = {};
+
+// CSV arsenal baselines: pitcherArsenalById[pitcherId] = { fastball, breaking, change }
+let pitcherArsenalById = {};
 
 /* -----------------------------
    COLORS
@@ -60,6 +69,115 @@ const colors = {
   cyan: "\x1b[36m",
   bold: "\x1b[1m",
 };
+
+/* -----------------------------
+   Pitch Mix Model (League)
+----------------------------- */
+const leaguePitchMixByCount = {
+  "0-0": { fastball: 0.63, breaking: 0.25, change: 0.12 },
+  "0-1": { fastball: 0.55, breaking: 0.30, change: 0.15 },
+  "0-2": { fastball: 0.40, breaking: 0.43, change: 0.17 },
+  "1-0": { fastball: 0.70, breaking: 0.20, change: 0.10 },
+  "1-1": { fastball: 0.58, breaking: 0.30, change: 0.12 },
+  "1-2": { fastball: 0.42, breaking: 0.45, change: 0.13 },
+  "2-0": { fastball: 0.72, breaking: 0.18, change: 0.10 },
+  "2-1": { fastball: 0.60, breaking: 0.28, change: 0.12 },
+  "2-2": { fastball: 0.50, breaking: 0.38, change: 0.12 },
+  "3-0": { fastball: 0.85, breaking: 0.10, change: 0.05 },
+  "3-1": { fastball: 0.75, breaking: 0.15, change: 0.10 },
+  "3-2": { fastball: 0.70, breaking: 0.20, change: 0.10 },
+};
+
+function normalize(obj) {
+  const s = Object.values(obj).reduce((a, b) => a + b, 0) || 1;
+  return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, v / s]));
+}
+
+/* ==========================================================
+   PITCH FAMILY MAPPING (Feed + CSV)
+   - fastball / breaking / change (offspeed)
+   - splitter / fork / screwball → change
+   - SI for sinker, SW for sweeper style, etc.
+========================================================== */
+
+function mapPitchCodeToBucket(code) {
+  if (!code) return null;
+  const c = code.toUpperCase();
+
+  // Fastballs (including sinker, 2-seam, cutters)
+  if (["FF", "FT", "SI", "FC", "FA"].includes(c)) return "fastball";
+
+  // Some sources use FS as split-finger; treat splitty as offspeed
+  if (["FS"].includes(c)) return "change";
+
+  // Offspeed / change family (changeup, splitter, forkball, screwball)
+  if (["CH", "SF", "FO", "SC"].includes(c)) return "change";
+
+  // Breaking: sliders, curves, knuckle, sweepers, etc.
+  if (["SL", "CU", "KC", "KN", "SV", "ST", "SW"].includes(c)) return "breaking";
+
+  // Fallback
+  return "fastball";
+}
+
+/* ==========================================================
+   CSV ARSENAL LOADING
+========================================================== */
+
+function loadPitcherArsenalFromCSV() {
+  try {
+    const csvRaw = fs.readFileSync(ARSENAL_CSV_PATH, "utf8");
+    const records = parse(csvRaw, { columns: true, skip_empty_lines: true });
+
+    const temp = {}; // pitcherId → { fastball, breaking, change, total }
+
+    for (const row of records) {
+      const idStr = row["player_id"] ?? row.player_id;
+      const pitchType = row["pitch_type"] ?? row.pitch_type;
+      const usageStr = row["pitch_usage"] ?? row.pitch_usage;
+
+      const id = Number(idStr);
+      if (!id || !pitchType || usageStr == null) continue;
+
+      const family = mapPitchCodeToBucket(pitchType);
+      if (!family) continue;
+
+      const usage = parseFloat(String(usageStr));
+      if (Number.isNaN(usage)) continue;
+
+      if (!temp[id]) {
+        temp[id] = { fastball: 0, breaking: 0, change: 0, total: 0 };
+      }
+
+      temp[id][family] += usage;
+      temp[id].total += usage;
+    }
+
+    pitcherArsenalById = {};
+    for (const [idStr, stats] of Object.entries(temp)) {
+      if (!stats.total) continue;
+      const idNum = Number(idStr);
+      pitcherArsenalById[idNum] = normalize({
+        fastball: stats.fastball,
+        breaking: stats.breaking,
+        change: stats.change,
+      });
+    }
+
+    console.log(
+      `📊 Loaded pitcher arsenal CSV for ${
+        Object.keys(pitcherArsenalById).length
+      } pitchers from ${ARSENAL_CSV_PATH}`
+    );
+  } catch (err) {
+    console.warn("⚠️ Could not load pitcher arsenal CSV:", err.message);
+    pitcherArsenalById = {};
+  }
+}
+
+function getPitcherArsenalMix(pitcherId) {
+  return pitcherArsenalById[pitcherId] || null;
+}
 
 /* ==========================================================
    BEST AVAILABLE COORDINATES SYSTEM
@@ -81,15 +199,19 @@ function getCoordKey(play, pitch) {
 }
 
 function storeCoordsInCache(play, pitch, coord) {
-  if (!coord || coord.px == null || coord.pz == null) return;
+  if (!coord) return;
 
   const key = getCoordKey(play, pitch);
 
   pitchCoordCache[key] = {
-    px: coord.px,
-    pz: coord.pz,
+    px: coord.px ?? null,
+    pz: coord.pz ?? null,
     szTop: coord.szTop ?? 3.5,
     szBot: coord.szBot ?? 1.5,
+    hb: coord.hb ?? null,
+    vb: coord.vb ?? null,
+    angle: coord.angle ?? null,
+    length: coord.length ?? null,
   };
 }
 
@@ -101,7 +223,6 @@ function storeCoordsInCache(play, pitch, coord) {
 function extractCoordinatesFromPitch(pitch) {
   if (!pitch) return { hasLocation: false };
 
-  // Tier 1: Statcast
   const pd = pitch.pitchData?.coordinates;
   if (pd && pd.pX != null && pd.pZ != null) {
     return {
@@ -113,7 +234,6 @@ function extractCoordinatesFromPitch(pitch) {
     };
   }
 
-  // Tier 2: legacy/details block
   const dc = pitch.details?.coordinates;
   if (dc && dc.px != null && dc.pz != null) {
     return {
@@ -129,7 +249,12 @@ function extractCoordinatesFromPitch(pitch) {
 }
 
 /**
- * Full Best-Available coordinate resolver for a pitch index.
+ * Full Best-Available resolver for a pitch index.
+ * Priority:
+ *  1. True location (pitchData / details)
+ *  1.5. Breaks block (HB / VB) if no location
+ *  2. Cache (same at-bat + pitchNumber)
+ *  3. Search same at-bat by pitchNumber
  */
 function getPitchCoordinates(game, playIdx, pitchIdx) {
   const play = game.liveData.plays.allPlays[playIdx];
@@ -143,28 +268,75 @@ function getPitchCoordinates(game, playIdx, pitchIdx) {
     pitch.pitchData?.pitchNumber ??
     null;
 
-  // Tier 1: direct from pitch
+  // Tier 1: direct from pitch (true location)
   const direct = extractCoordinatesFromPitch(pitch);
   if (direct.hasLocation) {
     storeCoordsInCache(play, pitch, direct);
     return direct;
   }
 
+  // Tier 1.5: Breaks block (movement only)
+  const br = pitch.breaks;
+  if (br) {
+    const hb = br.breakHorizontal;
+    const vb = br.breakVerticalInduced;
+    const angle = br.breakAngle;
+    const length = br.breakLength;
+
+    if (hb != null && vb != null) {
+      const movementCoord = {
+        px: null,
+        pz: null,
+        szTop: 3.5,
+        szBot: 1.5,
+        hb,
+        vb,
+        angle,
+        length,
+      };
+
+      storeCoordsInCache(play, pitch, movementCoord);
+
+      return {
+        hasLocation: false,
+        isBreakData: true,
+        hb,
+        vb,
+        angle,
+        length,
+      };
+    }
+  }
+
   // Tier 2: cache
   if (pitchNum != null && atBatIndex != null) {
     const key = getCoordKey(play, pitch);
     if (pitchCoordCache[key]) {
-      return { hasLocation: true, ...pitchCoordCache[key] };
+      const c = pitchCoordCache[key];
+      const hasLocation = c.px != null && c.pz != null;
+      return {
+        hasLocation,
+        isBreakData: !hasLocation && (c.hb != null || c.vb != null),
+        px: c.px,
+        pz: c.pz,
+        szTop: c.szTop,
+        szBot: c.szBot,
+        hb: c.hb,
+        vb: c.vb,
+        angle: c.angle,
+        length: c.length,
+      };
     }
   }
 
-  // Tier 3: search same at-bat for this pitchNumber
+  // Tier 3: search same at-bat by pitchNumber
   if (pitchNum != null && atBatIndex != null) {
     const plays = game.liveData.plays.allPlays;
     for (const p2 of plays) {
       if (p2.about?.atBatIndex !== atBatIndex) continue;
       for (const ev of p2.playEvents ?? []) {
         if (!ev.isPitch) continue;
+
         const evPitchNum =
           ev.pitchNumber ??
           ev.details?.pitchNumber ??
@@ -174,10 +346,34 @@ function getPitchCoordinates(game, playIdx, pitchIdx) {
         if (evPitchNum !== pitchNum) continue;
 
         const evCoord = extractCoordinatesFromPitch(ev);
-        if (!evCoord.hasLocation) continue;
+        if (evCoord.hasLocation) {
+          storeCoordsInCache(play, pitch, evCoord);
+          return evCoord;
+        }
 
-        storeCoordsInCache(play, pitch, evCoord);
-        return evCoord;
+        const br2 = ev.breaks;
+        if (br2 && br2.breakHorizontal != null && br2.breakVerticalInduced != null) {
+          const movementCoord = {
+            px: null,
+            pz: null,
+            szTop: 3.5,
+            szBot: 1.5,
+            hb: br2.breakHorizontal,
+            vb: br2.breakVerticalInduced,
+            angle: br2.breakAngle,
+            length: br2.breakLength,
+          };
+
+          storeCoordsInCache(play, pitch, movementCoord);
+          return {
+            hasLocation: false,
+            isBreakData: true,
+            hb: br2.breakHorizontal,
+            vb: br2.breakVerticalInduced,
+            angle: br2.breakAngle,
+            length: br2.breakLength,
+          };
+        }
       }
     }
   }
@@ -190,7 +386,31 @@ function getPitchCoordinates(game, playIdx, pitchIdx) {
    ASCII STRIKE ZONE (10×10)
 ----------------------------- */
 function asciiStrikeZone(loc) {
-  if (!loc || !loc.hasLocation) {
+  if (!loc) {
+    return (
+      colors.yellow +
+      "Location / movement data unavailable for this pitch." +
+      colors.reset
+    );
+  }
+
+  // Movement-only mode (no location, but HB/VB present)
+  if (!loc.hasLocation && loc.isBreakData) {
+    const hb = loc.hb ?? 0;
+    const vb = loc.vb ?? 0;
+    const ang = loc.angle ?? 0;
+    const len = loc.length ?? Math.sqrt(hb * hb + vb * vb);
+
+    return `
+   Movement (Statcast break):
+      HB: ${hb.toFixed(1)}″
+      VB: ${vb.toFixed(1)}″
+      Break: ${len.toFixed(1)}″
+      Angle: ${ang.toFixed(1)}°
+`;
+  }
+
+  if (!loc.hasLocation) {
     return (
       colors.yellow +
       "Location data unavailable for this pitch." +
@@ -225,29 +445,6 @@ function asciiStrikeZone(loc) {
 }
 
 /* -----------------------------
-   Pitch Mix Model (League)
------------------------------ */
-const leaguePitchMixByCount = {
-  "0-0": { fastball: 0.63, breaking: 0.25, change: 0.12 },
-  "0-1": { fastball: 0.55, breaking: 0.30, change: 0.15 },
-  "0-2": { fastball: 0.40, breaking: 0.43, change: 0.17 },
-  "1-0": { fastball: 0.70, breaking: 0.20, change: 0.10 },
-  "1-1": { fastball: 0.58, breaking: 0.30, change: 0.12 },
-  "1-2": { fastball: 0.42, breaking: 0.45, change: 0.13 },
-  "2-0": { fastball: 0.72, breaking: 0.18, change: 0.10 },
-  "2-1": { fastball: 0.60, breaking: 0.28, change: 0.12 },
-  "2-2": { fastball: 0.50, breaking: 0.38, change: 0.12 },
-  "3-0": { fastball: 0.85, breaking: 0.10, change: 0.05 },
-  "3-1": { fastball: 0.75, breaking: 0.15, change: 0.10 },
-  "3-2": { fastball: 0.70, breaking: 0.20, change: 0.10 },
-};
-
-function normalize(obj) {
-  const s = Object.values(obj).reduce((a, b) => a + b, 0) || 1;
-  return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, v / s]));
-}
-
-/* -----------------------------
    Pretty Helpers
 ----------------------------- */
 function prettyRunners(r) {
@@ -277,7 +474,7 @@ function prettyPrediction(pred) {
         )}
         ${coloredPitch(
           "change",
-          `Changeup: ${(pred.change * 100).toFixed(0)}%`
+          `Offspeed: ${(pred.change * 100).toFixed(0)}%`
         )}
   `;
 }
@@ -285,14 +482,23 @@ function prettyPrediction(pred) {
 function prettyContext(ctx) {
   const pitcherMix = ctx.pitcherGameMix;
   const ba = ctx.batterAggression;
+  const arsenal = ctx.pitcherArsenalMix;
 
   const pitcherMixStr = pitcherMix
     ? `   Pitcher game mix: F ${(pitcherMix.fastball * 100).toFixed(
         0
       )}% | Br ${(pitcherMix.breaking * 100).toFixed(
         0
-      )}% | Ch ${(pitcherMix.change * 100).toFixed(0)}%`
+      )}% | Off ${(pitcherMix.change * 100).toFixed(0)}%`
     : "   Pitcher game mix: (n/a yet)";
+
+  const arsenalStr = arsenal
+    ? `   Pitcher CSV arsenal: F ${(arsenal.fastball * 100).toFixed(
+        0
+      )}% | Br ${(arsenal.breaking * 100).toFixed(
+        0
+      )}% | Off ${(arsenal.change * 100).toFixed(0)}%`
+    : "   Pitcher CSV arsenal: (n/a yet)";
 
   const baStr =
     ba != null
@@ -308,6 +514,7 @@ function prettyContext(ctx) {
   }HB | Inning: ${ctx.inning} ${ctx.topBottom}
    Last pitch type: ${ctx.lastPitchType ?? "None"}
 ${pitcherMixStr}
+${arsenalStr}
 ${baStr}
   `;
 }
@@ -408,24 +615,6 @@ function outsFromPlay(play) {
    CONTEXT ENGINE: PITCHER + BATTER STATS
 ========================================================== */
 
-// Map raw MLB pitch codes → pitch families used by our model
-function mapPitchCodeToBucket(code) {
-  if (!code) return null;
-  const c = code.toUpperCase();
-
-  // Fastballs
-  if (["FF", "FT", "SI", "FS", "FC", "FA"].includes(c)) return "fastball";
-
-  // Changeups / splitters / fork
-  if (["CH", "FO", "SC", "SF"].includes(c)) return "change";
-
-  // Breaking (sliders, curves, cutters, knuckle, sweeper, etc)
-  if (["SL", "CU", "KC", "KN", "SV", "ST"].includes(c)) return "breaking";
-
-  // Fallback: just treat as fastball if unknown
-  return "fastball";
-}
-
 function updatePitcherStats(play, pitch) {
   const pitcherId = play.matchup.pitcher.id;
   const code = pitch.details?.type?.code;
@@ -461,12 +650,11 @@ function getPitcherGameMix(pitcherId) {
 function isSwing(pitch) {
   const d = (pitch.details?.description || "").toLowerCase();
 
-  if (pitch.details?.isInPlay) return true; // ball put in play
+  if (pitch.details?.isInPlay) return true;
   if (d.includes("swinging")) return true;
   if (d.includes("foul")) return true;
   if (d.includes("in play")) return true;
 
-  // Called strike, pitchout, etc = no swing
   return false;
 }
 
@@ -503,6 +691,7 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
 
     const pitcherGameMix = getPitcherGameMix(pitcherId);
     const batterAggression = getBatterAggression(batterId);
+    const pitcherArsenalMix = getPitcherArsenalMix(pitcherId);
 
     return {
       inning: play.about.inning,
@@ -525,6 +714,7 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
       location,
       pitcherGameMix,
       batterAggression,
+      pitcherArsenalMix,
     };
   } catch {
     return null;
@@ -533,14 +723,14 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
 
 /* -----------------------------
    Predict Next Pitch
-   (League-by-count blended with pitcher game mix)
+   League baseline + CSV arsenal + game mix
 ----------------------------- */
 function predictPitchType(ctx) {
   if (!ctx) return { fastball: 0.33, breaking: 0.33, change: 0.34 };
 
   const key = `${ctx.balls}-${ctx.strikes}`;
 
-  // Start from league average by count
+  // League baseline by count
   let mix = {
     ...(leaguePitchMixByCount[key] || {
       fastball: 0.6,
@@ -548,6 +738,23 @@ function predictPitchType(ctx) {
       change: 0.15,
     }),
   };
+
+  // Blend in CSV arsenal baseline (pitcher tendencies)
+  if (ctx.pitcherArsenalMix) {
+    const wLeague = 0.5;
+    const wArsenal = 0.5;
+    mix = {
+      fastball:
+        wLeague * (mix.fastball ?? 0) +
+        wArsenal * (ctx.pitcherArsenalMix.fastball ?? 0),
+      breaking:
+        wLeague * (mix.breaking ?? 0) +
+        wArsenal * (ctx.pitcherArsenalMix.breaking ?? 0),
+      change:
+        wLeague * (mix.change ?? 0) +
+        wArsenal * (ctx.pitcherArsenalMix.change ?? 0),
+    };
+  }
 
   // Handedness adjustments
   if (ctx.pitcherThrows === "R" && ctx.batterBats === "L") {
@@ -567,20 +774,22 @@ function predictPitchType(ctx) {
     mix.fastball -= 0.03;
   }
 
-  // NEW: blend in pitcher-specific game mix
+  mix = normalize(mix);
+
+  // Blend in pitcher-specific game mix (what he's actually done this game)
   if (ctx.pitcherGameMix) {
-    const wLeague = 0.7;
-    const wPitcher = 0.3;
+    const wBase = 0.7; // league+arsenal
+    const wGame = 0.3; // in-game usage
     mix = {
       fastball:
-        wLeague * (mix.fastball ?? 0) +
-        wPitcher * (ctx.pitcherGameMix.fastball ?? 0),
+        wBase * (mix.fastball ?? 0) +
+        wGame * (ctx.pitcherGameMix.fastball ?? 0),
       breaking:
-        wLeague * (mix.breaking ?? 0) +
-        wPitcher * (ctx.pitcherGameMix.breaking ?? 0),
+        wBase * (mix.breaking ?? 0) +
+        wGame * (ctx.pitcherGameMix.breaking ?? 0),
       change:
-        wLeague * (mix.change ?? 0) +
-        wPitcher * (ctx.pitcherGameMix.change ?? 0),
+        wBase * (mix.change ?? 0) +
+        wGame * (ctx.pitcherGameMix.change ?? 0),
     };
   }
 
@@ -643,7 +852,7 @@ async function handleReplayMode() {
   console.log(
     colors.bold +
       `🎯 Pitch ${pitchPointer + 1} — ` +
-      (mph ? `${mph.toFixed ? mph.toFixed(1) : mph} mph ` : "") +
+      (mph ? `${(mph.toFixed ? mph.toFixed(1) : mph)} mph ` : "") +
       `${pitch.details?.type?.code ?? "??"} — ${
         pitch.details?.description || "Unknown"
       }` +
@@ -665,10 +874,10 @@ async function handleReplayMode() {
   console.log(colors.green + "   ➤ Next Pitch Probabilities:" + colors.reset);
   console.log(prettyPrediction(prediction));
 
-  console.log(colors.blue + "\nASCII Strike Zone:\n" + colors.reset);
+  console.log(colors.blue + "\nASCII Strike Zone / Movement:\n" + colors.reset);
   console.log(asciiStrikeZone(ctx?.location));
 
-  // 🔥 UPDATE CONTEXT STATS AFTER USING THEM
+  // Update context stats after using them
   updatePitcherStats(play, pitch);
   updateBatterStats(play, pitch);
 
@@ -708,6 +917,9 @@ async function fetchGameData() {
    MAIN LOOP
 ----------------------------- */
 async function gameLoop() {
+  // load CSV arsenal once at startup
+  loadPitcherArsenalFromCSV();
+
   const initial = await fetchGameData();
   if (!initial) return;
 
