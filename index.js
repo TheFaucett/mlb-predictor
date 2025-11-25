@@ -4,6 +4,7 @@
    + Enhanced Context Engine (A3)
    + Break Movement (HB / VB) Fallback
    + CSV Arsenal Baselines
+   + Optimal vs Likely Pitch Model
 ----------------------------- */
 
 import express from "express";
@@ -17,13 +18,13 @@ const PORT = 4000;
 /* -----------------------------
    CONFIG
 ----------------------------- */
-const GAME_ID = 745316; // regular-season game w/ Statcast
+const GAME_ID = 746480; // 2024 Chris Sale vs SF
 const URL = `https://statsapi.mlb.com/api/v1.1/game/${GAME_ID}/feed/live`;
 const LIVE_POLL_RATE = 10000;
 const REPLAY_RATE = 5500;
 
-// path to your CSV (you can change this)
-const ARSENAL_CSV_PATH = "../pitch-arsenal-stats.csv";
+// path to your CSV
+const ARSENAL_CSV_PATH = "./pitch-arsenal-stats.csv";
 
 /* -----------------------------
    STATE
@@ -55,6 +56,9 @@ let batterAggressionStats = {};
 
 // CSV arsenal baselines: pitcherArsenalById[pitcherId] = { fastball, breaking, change }
 let pitcherArsenalById = {};
+
+// batterVsPitchStats[batterId] = { fastball:{...}, breaking:{...}, change:{...} }
+let batterVsPitchStats = {};
 
 /* -----------------------------
    COLORS
@@ -97,7 +101,7 @@ function normalize(obj) {
    PITCH FAMILY MAPPING (Feed + CSV)
    - fastball / breaking / change (offspeed)
    - splitter / fork / screwball → change
-   - SI for sinker, SW for sweeper style, etc.
+   - SI for sinker, SW for sweeper, FC cutter as fastball
 ========================================================== */
 
 function mapPitchCodeToBucket(code) {
@@ -107,10 +111,10 @@ function mapPitchCodeToBucket(code) {
   // Fastballs (including sinker, 2-seam, cutters)
   if (["FF", "FT", "SI", "FC", "FA"].includes(c)) return "fastball";
 
-  // Some sources use FS as split-finger; treat splitty as offspeed
+  // Split-finger fastball treated as offspeed/splitter
   if (["FS"].includes(c)) return "change";
 
-  // Offspeed / change family (changeup, splitter, forkball, screwball)
+  // Offspeed / change family (actual CH, splitter, fork, screwball)
   if (["CH", "SF", "FO", "SC"].includes(c)) return "change";
 
   // Breaking: sliders, curves, knuckle, sweepers, etc.
@@ -352,7 +356,11 @@ function getPitchCoordinates(game, playIdx, pitchIdx) {
         }
 
         const br2 = ev.breaks;
-        if (br2 && br2.breakHorizontal != null && br2.breakVerticalInduced != null) {
+        if (
+          br2 &&
+          br2.breakHorizontal != null &&
+          br2.breakVerticalInduced != null
+        ) {
           const movementCoord = {
             px: null,
             pz: null,
@@ -479,10 +487,26 @@ function prettyPrediction(pred) {
   `;
 }
 
+function prettyOptimal(opt) {
+  const mix = opt.mix;
+  const best = opt.best;
+  const label =
+    best === "fastball" ? "Fastball" : best === "breaking" ? "Breaking" : "Offspeed";
+
+  return `
+        Recommended family: ${label} (${(mix[best] * 100).toFixed(0)}%)
+        Full optimal mix:
+        Fastball: ${(mix.fastball * 100).toFixed(0)}%
+        Breaking: ${(mix.breaking * 100).toFixed(0)}%
+        Offspeed: ${(mix.change * 100).toFixed(0)}%
+  `;
+}
+
 function prettyContext(ctx) {
   const pitcherMix = ctx.pitcherGameMix;
   const ba = ctx.batterAggression;
   const arsenal = ctx.pitcherArsenalMix;
+  const bvp = ctx.batterVsPitch;
 
   const pitcherMixStr = pitcherMix
     ? `   Pitcher game mix: F ${(pitcherMix.fastball * 100).toFixed(
@@ -505,6 +529,10 @@ function prettyContext(ctx) {
       ? `   Batter aggression (swings/pitches): ${(ba * 100).toFixed(0)}%`
       : "   Batter aggression: (n/a yet)";
 
+  const weakStr = bvp?.topWeakFamily
+    ? `   Batter weakness this game: ${bvp.topWeakFamily}`
+    : "   Batter weakness this game: (n/a yet)";
+
   return `
    Count: ${ctx.balls}-${ctx.strikes} | Outs: ${ctx.outs} | Runners: ${prettyRunners(
     ctx.runnersOn
@@ -516,6 +544,7 @@ function prettyContext(ctx) {
 ${pitcherMixStr}
 ${arsenalStr}
 ${baStr}
+${weakStr}
   `;
 }
 
@@ -676,6 +705,206 @@ function getBatterAggression(batterId) {
   return stats.swings / stats.pitches;
 }
 
+/* ==========================================================
+   BATTER vs PITCH FAMILY WEAKNESS MODEL
+========================================================== */
+
+function ensureBatterFamily(batterId, family) {
+  if (!batterVsPitchStats[batterId]) {
+    batterVsPitchStats[batterId] = {
+      fastball: { seen: 0, swings: 0, whiffs: 0, inPlay: 0, hits: 0, hardHit: 0 },
+      breaking: { seen: 0, swings: 0, whiffs: 0, inPlay: 0, hits: 0, hardHit: 0 },
+      change: { seen: 0, swings: 0, whiffs: 0, inPlay: 0, hits: 0, hardHit: 0 },
+    };
+  }
+  if (!batterVsPitchStats[batterId][family]) {
+    batterVsPitchStats[batterId][family] = {
+      seen: 0,
+      swings: 0,
+      whiffs: 0,
+      inPlay: 0,
+      hits: 0,
+      hardHit: 0,
+    };
+  }
+}
+
+function updateBatterVsPitchStats(play, pitch, bucket, isLastPitch) {
+  if (!bucket) return;
+
+  const batterId = play.matchup.batter.id;
+  ensureBatterFamily(batterId, bucket);
+  const stats = batterVsPitchStats[batterId][bucket];
+
+  stats.seen += 1;
+
+  const desc = (pitch.details?.description || "").toLowerCase();
+  const swung = isSwing(pitch);
+  if (swung) stats.swings += 1;
+
+  const swingingStrike =
+    swung &&
+    desc.includes("swinging") &&
+    !desc.includes("foul") &&
+    !desc.includes("in play");
+  if (swingingStrike) stats.whiffs += 1;
+
+  const inPlay = pitch.details?.isInPlay || desc.includes("in play");
+  if (inPlay) stats.inPlay += 1;
+
+  // Only classify hit / hard-hit on last pitch of the PA
+  if (isLastPitch) {
+    const eventType = (play.result?.eventType || "").toLowerCase();
+    const isHit =
+      eventType.includes("single") ||
+      eventType.includes("double") ||
+      eventType.includes("triple") ||
+      eventType.includes("home_run") ||
+      eventType.includes("home run");
+
+    if (isHit) {
+      stats.hits += 1;
+    }
+
+    const ls = pitch.hitData?.launchSpeed;
+    if (typeof ls === "number" && ls >= 95) {
+      stats.hardHit += 1;
+    }
+  }
+}
+
+function getBatterVsPitchProfile(batterId) {
+  const raw = batterVsPitchStats[batterId];
+  if (!raw) return null;
+
+  const families = ["fastball", "breaking", "change"];
+  const vuln = {};
+  let topWeakFamily = null;
+  let bestScore = -Infinity;
+
+  for (const fam of families) {
+    const s = raw[fam] || {
+      seen: 0,
+      swings: 0,
+      whiffs: 0,
+      inPlay: 0,
+      hits: 0,
+      hardHit: 0,
+    };
+    const seen = s.seen || 0;
+    const swings = s.swings || 0;
+    const whiffs = s.whiffs || 0;
+    const inPlay = s.inPlay || 0;
+    const hits = s.hits || 0;
+    const hardHit = s.hardHit || 0;
+
+    const whiffRate = swings > 0 ? whiffs / swings : 0;
+    const hitRate = inPlay > 0 ? hits / inPlay : 0;
+    const hardHitRate = inPlay > 0 ? hardHit / inPlay : 0;
+
+    // Higher score = batter worse vs that family
+    const score =
+      0.6 * whiffRate +
+      0.25 * (1 - hitRate) +
+      0.15 * (1 - hardHitRate);
+
+    vuln[fam] = score;
+
+    if (seen >= 3 && score > bestScore) {
+      bestScore = score;
+      topWeakFamily = fam;
+    }
+
+    // attach the derived rates back on raw[fam]
+    s.whiffRate = whiffRate;
+    s.hitRate = hitRate;
+    s.hardHitRate = hardHitRate;
+  }
+
+  return {
+    ...raw,
+    vuln,
+    topWeakFamily,
+  };
+}
+
+/* ==========================================================
+   OPTIMAL PITCH (WHAT HE SHOULD THROW)
+========================================================== */
+
+function getCountFactor(family, balls, strikes) {
+  const count = `${balls}-${strikes}`;
+
+  // Way ahead in count: favor chase stuff
+  if (strikes >= 2 && balls <= 1) {
+    if (family === "breaking") return 1.25;
+    if (family === "change") return 1.15;
+    return 0.8; // fastball
+  }
+
+  // Behind in count: more likely to need a strike
+  if (balls >= 2 && strikes <= 1) {
+    if (family === "fastball") return 1.2;
+    if (family === "breaking") return 0.9;
+    if (family === "change") return 0.9;
+  }
+
+  // Full count nuance
+  if (count === "3-2") {
+    if (family === "fastball") return 1.05;
+    if (family === "breaking") return 0.95;
+    if (family === "change") return 1.0;
+  }
+
+  return 1.0;
+}
+
+function recommendOptimalPitch(ctx) {
+  // Baseline from arsenal (what he actually throws)
+  let base =
+    ctx.pitcherArsenalMix || leaguePitchMixByCount[`${ctx.balls}-${ctx.strikes}`] || {
+      fastball: 0.6,
+      breaking: 0.25,
+      change: 0.15,
+    };
+  base = normalize(base);
+
+  const vuln = ctx.batterVsPitch?.vuln || null;
+
+  const families = ["fastball", "breaking", "change"];
+  const scores = {};
+
+  for (const fam of families) {
+    let score = base[fam] ?? 1 / 3;
+
+    // If we have batter vulnerability data, blend it in
+    if (vuln && typeof vuln[fam] === "number") {
+      // vulnerability is already 0..1-ish; more vulnerable → higher score
+      score = 0.4 * score + 0.6 * vuln[fam];
+    }
+
+    // Count leverage adjustment
+    const cf = getCountFactor(fam, ctx.balls, ctx.strikes);
+    score *= cf;
+
+    scores[fam] = score;
+  }
+
+  const mix = normalize(scores);
+
+  // pick best
+  let best = "fastball";
+  let bestVal = mix.fastball;
+  for (const fam of families) {
+    if (mix[fam] > bestVal) {
+      bestVal = mix[fam];
+      best = fam;
+    }
+  }
+
+  return { mix, best };
+}
+
 /* -----------------------------
    Build Replay Pitch Context
 ----------------------------- */
@@ -692,6 +921,7 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
     const pitcherGameMix = getPitcherGameMix(pitcherId);
     const batterAggression = getBatterAggression(batterId);
     const pitcherArsenalMix = getPitcherArsenalMix(pitcherId);
+    const batterVsPitch = getBatterVsPitchProfile(batterId);
 
     return {
       inning: play.about.inning,
@@ -715,6 +945,10 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
       pitcherGameMix,
       batterAggression,
       pitcherArsenalMix,
+      batterVsPitch,
+
+      pitcherId,
+      batterId,
     };
   } catch {
     return null;
@@ -722,7 +956,7 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
 }
 
 /* -----------------------------
-   Predict Next Pitch
+   Predict Next Pitch (LIKELY)
    League baseline + CSV arsenal + game mix
 ----------------------------- */
 function predictPitchType(ctx) {
@@ -810,6 +1044,7 @@ async function handleReplayMode() {
     pitchCoordCache = {};
     pitcherGameStats = {};
     batterAggressionStats = {};
+    batterVsPitchStats = {};
   }
 
   if (pitchPointer >= pitchIndexMap.length) {
@@ -842,7 +1077,8 @@ async function handleReplayMode() {
   }
 
   const ctx = buildReplayPitchContext(lastGameData, playIdx, pitchIdx, outsBefore);
-  const prediction = predictPitchType(ctx);
+  const likelyMix = predictPitchType(ctx);
+  const optimal = recommendOptimalPitch(ctx);
 
   const mph =
     pitch.pitchData?.startSpeed ??
@@ -871,15 +1107,20 @@ async function handleReplayMode() {
 
   if (ctx) console.log(prettyContext(ctx));
 
-  console.log(colors.green + "   ➤ Next Pitch Probabilities:" + colors.reset);
-  console.log(prettyPrediction(prediction));
+  console.log(colors.green + "   ➤ Expected Next Pitch (Likely):" + colors.reset);
+  console.log(prettyPrediction(likelyMix));
+
+  console.log(colors.magenta + "   ➤ Recommended Pitch (Optimal):" + colors.reset);
+  console.log(prettyOptimal(optimal));
 
   console.log(colors.blue + "\nASCII Strike Zone / Movement:\n" + colors.reset);
   console.log(asciiStrikeZone(ctx?.location));
 
-  // Update context stats after using them
+  // Update context stats AFTER using them (info available at “decision time”)
+  const bucket = mapPitchCodeToBucket(pitch.details?.type?.code);
   updatePitcherStats(play, pitch);
   updateBatterStats(play, pitch);
+  updateBatterVsPitchStats(play, pitch, bucket, isLastPitch);
 
   // Outs update on last pitch of play
   if (isLastPitch) {
@@ -959,9 +1200,38 @@ app.get("/api/pitch-type", (req, res) => {
     pitchIdx,
     simulatedOuts
   );
-  const probs = predictPitchType(ctx);
+  const likely = predictPitchType(ctx);
+  const optimal = recommendOptimalPitch(ctx);
 
-  res.json({ context: ctx, probabilities: probs });
+  res.json({ context: ctx, likely, optimal });
+});
+
+app.get("/api/arsenal/:pid", (req, res) => {
+  const pid = Number(req.params.pid);
+
+  if (!pitcherArsenalById || Object.keys(pitcherArsenalById).length === 0) {
+    return res.json({
+      error: "Pitcher arsenal CSV not loaded or parsed yet.",
+    });
+  }
+
+  const data = pitcherArsenalById[pid];
+
+  if (!data) {
+    return res.json({
+      error: `No arsenal data found for player_id ${pid}`,
+      tip: "Check if your CSV includes this pitcher_id.",
+    });
+  }
+
+  res.json({
+    player_id: pid,
+    arsenal: {
+      fastball: data.fastball,
+      breaking: data.breaking,
+      offspeed: data.change,
+    },
+  });
 });
 
 /* -----------------------------
