@@ -5,6 +5,8 @@
    + Break Movement (HB / VB) Fallback
    + CSV Arsenal Baselines
    + Optimal vs Likely Pitch Model
+   + Location-Aware Sequencing
+   + Hybrid Tunnel Detection (Location + Movement)
 ----------------------------- */
 
 import express from "express";
@@ -33,6 +35,7 @@ let pitchIndexMap = [];
 let lastGameData = null;
 let replayModeActive = false;
 let pitchPointer = 0;
+let lastCtx = null;
 
 // Pretty log state
 let lastInningPrinted = null;
@@ -56,6 +59,9 @@ let batterAggressionStats = {};
 
 // CSV arsenal baselines: pitcherArsenalById[pitcherId] = { fastball, breaking, change }
 let pitcherArsenalById = {};
+
+// Per-pitcher, per-family type usage: pitcherTypeUsageById[pitcherId] = { fastball:{FF:%,SI:%}, ... }
+let pitcherTypeUsageById = {};
 
 // batterVsPitchStats[batterId] = { fastball:{...}, breaking:{...}, change:{...} }
 let batterVsPitchStats = {};
@@ -102,23 +108,31 @@ function normalize(obj) {
    - fastball / breaking / change (offspeed)
    - splitter / fork / screwball → change
    - SI for sinker, SW for sweeper, FC cutter as fastball
+   - FT treated same as SI
 ========================================================== */
 
 function mapPitchCodeToBucket(code) {
   if (!code) return null;
-  const c = code.toUpperCase();
+  const c = String(code).toUpperCase();
+
+  // Normalize some codes to preferences
+  const normalized =
+    c === "FT" ? "SI" :
+    c === "ST" ? "SW" :
+    c;
 
   // Fastballs (including sinker, 2-seam, cutters)
-  if (["FF", "FT", "SI", "FC", "FA"].includes(c)) return "fastball";
+  if (["FF", "FT", "SI", "FC", "FA"].includes(normalized)) return "fastball";
 
   // Split-finger fastball treated as offspeed/splitter
-  if (["FS"].includes(c)) return "change";
+  if (["FS"].includes(normalized)) return "change";
 
   // Offspeed / change family (actual CH, splitter, fork, screwball)
-  if (["CH", "SF", "FO", "SC"].includes(c)) return "change";
+  if (["CH", "SF", "FO", "SC"].includes(normalized)) return "change";
 
   // Breaking: sliders, curves, knuckle, sweepers, etc.
-  if (["SL", "CU", "KC", "KN", "SV", "ST", "SW"].includes(c)) return "breaking";
+  if (["SL", "CU", "KC", "KN", "SV", "ST", "SW"].includes(normalized))
+    return "breaking";
 
   // Fallback
   return "fastball";
@@ -133,39 +147,77 @@ function loadPitcherArsenalFromCSV() {
     const csvRaw = fs.readFileSync(ARSENAL_CSV_PATH, "utf8");
     const records = parse(csvRaw, { columns: true, skip_empty_lines: true });
 
-    const temp = {}; // pitcherId → { fastball, breaking, change, total }
+    const familyAgg = {}; // pitcherId → { fastball, breaking, change, total }
+    const typeAgg = {};   // pitcherId → { fastball:{code:usage}, breaking:{}, change:{}, totalByFamily:{} }
 
     for (const row of records) {
       const idStr = row["player_id"] ?? row.player_id;
-      const pitchType = row["pitch_type"] ?? row.pitch_type;
+      let pitchType = row["pitch_type"] ?? row.pitch_type;
       const usageStr = row["pitch_usage"] ?? row.pitch_usage;
 
       const id = Number(idStr);
       if (!id || !pitchType || usageStr == null) continue;
 
-      const family = mapPitchCodeToBucket(pitchType);
+      let rawCode = String(pitchType).toUpperCase();
+
+      // Normalize to user prefs
+      if (rawCode === "FT") rawCode = "SI";
+      if (rawCode === "ST") rawCode = "SW";
+
+      const family = mapPitchCodeToBucket(rawCode);
       if (!family) continue;
 
       const usage = parseFloat(String(usageStr));
       if (Number.isNaN(usage)) continue;
 
-      if (!temp[id]) {
-        temp[id] = { fastball: 0, breaking: 0, change: 0, total: 0 };
+      if (!familyAgg[id]) {
+        familyAgg[id] = { fastball: 0, breaking: 0, change: 0, total: 0 };
       }
+      familyAgg[id][family] += usage;
+      familyAgg[id].total += usage;
 
-      temp[id][family] += usage;
-      temp[id].total += usage;
+      if (!typeAgg[id]) {
+        typeAgg[id] = {
+          fastball: {},
+          breaking: {},
+          change: {},
+          totalByFamily: { fastball: 0, breaking: 0, change: 0 },
+        };
+      }
+      if (!typeAgg[id][family][rawCode]) {
+        typeAgg[id][family][rawCode] = 0;
+      }
+      typeAgg[id][family][rawCode] += usage;
+      typeAgg[id].totalByFamily[family] += usage;
     }
 
     pitcherArsenalById = {};
-    for (const [idStr, stats] of Object.entries(temp)) {
-      if (!stats.total) continue;
+    pitcherTypeUsageById = {};
+
+    for (const [idStr, stats] of Object.entries(familyAgg)) {
       const idNum = Number(idStr);
+      if (!stats.total) continue;
+
       pitcherArsenalById[idNum] = normalize({
         fastball: stats.fastball,
         breaking: stats.breaking,
         change: stats.change,
       });
+
+      const typeInfo = typeAgg[idNum];
+      if (typeInfo) {
+        const famTypes = {};
+        for (const fam of ["fastball", "breaking", "change"]) {
+          const codes = typeInfo[fam] || {};
+          const totalFam = typeInfo.totalByFamily[fam] || 0;
+          const normalizedCodes = {};
+          for (const [code, u] of Object.entries(codes)) {
+            normalizedCodes[code] = totalFam ? u / totalFam : 0;
+          }
+          famTypes[fam] = normalizedCodes;
+        }
+        pitcherTypeUsageById[idNum] = famTypes;
+      }
     }
 
     console.log(
@@ -176,6 +228,7 @@ function loadPitcherArsenalFromCSV() {
   } catch (err) {
     console.warn("⚠️ Could not load pitcher arsenal CSV:", err.message);
     pitcherArsenalById = {};
+    pitcherTypeUsageById = {};
   }
 }
 
@@ -390,6 +443,326 @@ function getPitchCoordinates(game, playIdx, pitchIdx) {
   return { hasLocation: false };
 }
 
+/* ==========================================================
+   LOCATION CLASSIFICATION
+   3×3 grid: High/Mid/Low × Arm/Middle/Glove
+========================================================== */
+
+function classifyLocation(px, pz, szTop, szBot) {
+  if (px == null || pz == null || szTop == null || szBot == null) {
+    return null;
+  }
+
+  const horizontal =
+    px > 0.5 ? "ARM" :
+    px < -0.5 ? "GLOVE" :
+    "MIDDLE";
+
+  const zoneHeight = szTop - szBot;
+  if (zoneHeight <= 0) return null;
+
+  const highThresh = szTop - zoneHeight / 3;
+  const lowThresh = szBot + zoneHeight / 3;
+
+  let height;
+  if (pz >= highThresh) height = "HIGH";
+  else if (pz <= lowThresh) height = "LOW";
+  else height = "MID";
+
+  return `${height}_${horizontal}`; // e.g. "LOW_GLOVE"
+}
+
+function prettyLocationLabel(zone) {
+  if (!zone) return null;
+  switch (zone) {
+    case "HIGH_ARM":
+      return "Up & in";
+    case "HIGH_MIDDLE":
+      return "Up";
+    case "HIGH_GLOVE":
+      return "Up & away";
+    case "MID_ARM":
+      return "In";
+    case "MID_MIDDLE":
+      return "Middle";
+    case "MID_GLOVE":
+      return "Away";
+    case "LOW_ARM":
+      return "Down & in";
+    case "LOW_MIDDLE":
+      return "Down";
+    case "LOW_GLOVE":
+      return "Down & away";
+    default:
+      return zone;
+  }
+}
+
+/* ==========================================================
+   TUNNEL DETECTION (HYBRID)
+========================================================== */
+
+// Location-based alignment thresholds (Statcast px/pz are in feet)
+const LOCATION_TUNNEL_PX_THRESHOLD = 0.2;   // ≈ 2.4 inches horizontally
+const LOCATION_TUNNEL_PZ_THRESHOLD = 0.25;  // ≈ 3 inches vertically
+
+// Movement-based divergence thresholds (HB/VB in inches)
+const TUNNEL_BREAK_DIFF_THRESHOLD_LOC = 6.0;  // for location+movement mode
+const TUNNEL_BREAK_DIFF_THRESHOLD_MOV = 8.0;  // for movement-only mode
+
+function detectTunnel(prevCtx, currCtx) {
+  if (!prevCtx || !currCtx) return null;
+  if (!prevCtx.location || !currCtx.location) return null;
+
+  const A = prevCtx.location;
+  const B = currCtx.location;
+
+  const hasLocA = !!A.hasLocation && A.px != null && A.pz != null;
+  const hasLocB = !!B.hasLocation && B.px != null && B.pz != null;
+
+  const hasBreakA = A.hb != null && A.vb != null;
+  const hasBreakB = B.hb != null && B.vb != null;
+
+  // Need at least movement to define "late break divergence"
+  if (!hasBreakA || !hasBreakB) return null;
+
+  const bothHaveLoc = hasLocA && hasLocB;
+
+  let pxDiff = null;
+  let pzDiff = null;
+  let earlyAligned = false;
+  let mode = "movement";
+
+  if (bothHaveLoc) {
+    // True tunneling: similar approach window
+    pxDiff = Math.abs(A.px - B.px);
+    pzDiff = Math.abs(A.pz - B.pz);
+    earlyAligned =
+      pxDiff < LOCATION_TUNNEL_PX_THRESHOLD &&
+      pzDiff < LOCATION_TUNNEL_PZ_THRESHOLD;
+    mode = "location";
+  } else {
+    // Movement-only: we can't verify early alignment,
+    // but we still let movement-based tunnels fire in a looser sense.
+    earlyAligned = true;
+    mode = "movement";
+  }
+
+  if (!earlyAligned) return null;
+
+  const hbDiff = Math.abs(A.hb - B.hb);
+  const vbDiff = Math.abs(A.vb - B.vb);
+  const totalBreakDiff = Math.hypot(hbDiff, vbDiff);
+
+  const breakThreshold =
+    mode === "location"
+      ? TUNNEL_BREAK_DIFF_THRESHOLD_LOC
+      : TUNNEL_BREAK_DIFF_THRESHOLD_MOV;
+
+  if (totalBreakDiff < breakThreshold) return null;
+
+  // Label the tunnel pattern
+  const prevType = prevCtx.lastPitchType;
+  const currType = currCtx.lastPitchType;
+
+  let label = mode === "location"
+    ? "Pitch Tunnel Detected"
+    : "Movement-Only Tunnel Detected";
+
+  if (prevType && currType) {
+    const p = prevType.toUpperCase();
+    const c = currType.toUpperCase();
+
+    if ((p === "FF" || p === "SI") && (c === "SL" || c === "SW")) {
+      label = mode === "location"
+        ? "Fastball → Slider Tunnel"
+        : "Fastball → Slider Movement Tunnel";
+    } else if ((p === "FF" || p === "SI") && c === "CH") {
+      label = mode === "location"
+        ? "Fastball → Change Fade Tunnel"
+        : "Fastball → Change Movement Tunnel";
+    } else if (p === "SL" && c === "CU") {
+      label = mode === "location"
+        ? "Slider → Curveball Break Stack"
+        : "Slider → Curveball Movement Stack";
+    } else {
+      label = `${prevType} → ${currType} ${mode === "location" ? "Tunnel" : "Movement Tunnel"}`;
+    }
+  }
+
+  return {
+    mode,
+    pxDiff,
+    pzDiff,
+    hbDiff,
+    vbDiff,
+    totalBreakDiff,
+    label,
+  };
+}
+
+/* ==========================================================
+   SEQUENCING INFLUENCE MATRIX (SIM v1.0)
+   Applies MLB-like pitch sequencing biases
+========================================================== */
+
+function applySequencingAdjustments(mix, ctx) {
+  if (!ctx) return mix;
+
+  const last = ctx.lastPitchType ? mapPitchCodeToBucket(ctx.lastPitchType) : null;
+  const desc = (ctx.lastPitchDescription || "").toLowerCase();
+
+  const balls = ctx.balls ?? 0;
+  const strikes = ctx.strikes ?? 0;
+
+  // clone mix
+  let m = { ...mix };
+
+  /* -----------------------------
+     1. COUNT-BASED SEQUENCING
+  ----------------------------- */
+
+  // Way ahead (0–2, 1–2): more chase breaking
+  if ((balls === 0 && strikes === 2) || (balls === 1 && strikes === 2)) {
+    m.breaking += 0.12;
+    m.change += 0.05;
+    m.fastball -= 0.10;
+  }
+
+  // Behind (2–0, 3–1): establish heater
+  if ((balls === 2 && strikes === 0) || (balls === 3 && strikes === 1)) {
+    m.fastball += 0.10;
+    m.breaking -= 0.06;
+    m.change -= 0.04;
+  }
+
+  // Full count: rely on comfort pitches
+  if (balls === 3 && strikes === 2 && ctx.pitcherArsenalMix) {
+    m.fastball += ctx.pitcherArsenalMix.fastball * 0.10;
+    m.breaking += ctx.pitcherArsenalMix.breaking * 0.05;
+    m.change += ctx.pitcherArsenalMix.change * 0.05;
+  }
+
+  /* -----------------------------
+     2. LAST-PITCH SEQUENCES
+  ----------------------------- */
+
+  if (last === "fastball") {
+    // Fastball → breaker is most common MLB tunnel sequence
+    m.breaking += 0.06;
+    m.change += 0.02;
+    m.fastball -= 0.06;
+  }
+
+  if (last === "breaking") {
+    // After a slider/curve, go high fastball or CH
+    m.fastball += 0.04;
+    m.change += 0.03;
+    m.breaking -= 0.04;
+  }
+
+  if (last === "change") {
+    // After CH, MLB goes breaking or fastball
+    m.breaking += 0.04;
+    m.fastball += 0.02;
+    m.change -= 0.06;
+  }
+
+  /* -----------------------------
+     3. SWING RESULT SEQUENCING
+  ----------------------------- */
+
+  if (desc.includes("swinging strike") && !desc.includes("foul")) {
+    // Whiff → repeat pitch family
+    if (last === "fastball") m.fastball += 0.10;
+    if (last === "breaking") m.breaking += 0.10;
+    if (last === "change") m.change += 0.10;
+  }
+
+  if (desc.includes("foul")) {
+    // MLB usually goes to a different plane: up/down or slow/fast
+    if (last === "fastball") {
+      m.breaking += 0.05;
+      m.change += 0.03;
+    } else {
+      m.fastball += 0.07;
+    }
+  }
+
+  if (desc.includes("ball")) {
+    // Lost command → go back to strike-getter
+    m.fastball += 0.06;
+    m.breaking -= 0.03;
+    m.change -= 0.03;
+  }
+
+  if (desc.includes("called strike")) {
+    // Many pitchers go breaking low next
+    m.breaking += 0.04;
+  }
+
+  /* -----------------------------
+     4. Two-pitch pattern logic
+  ----------------------------- */
+
+  const seq = ctx.lastTwoPitchTypes
+    ? ctx.lastTwoPitchTypes.map(mapPitchCodeToBucket)
+    : [];
+
+  if (seq.length === 2 && seq[0] === seq[1]) {
+    // 2 straight same pitch family → break pattern
+    const repeated = seq[0];
+    if (repeated === "fastball") m.breaking += 0.10;
+    if (repeated === "breaking") m.fastball += 0.08;
+    if (repeated === "change") m.breaking += 0.07;
+  }
+
+  return normalize(m);
+}
+
+/* ==========================================================
+   LOCATION-AWARE SEQUENCING
+========================================================== */
+
+function applyLocationSequencing(mix, ctx) {
+  if (!ctx) return mix;
+  const zone = ctx.lastPitchLocationZone;
+  const last = ctx.lastPitchType ? mapPitchCodeToBucket(ctx.lastPitchType) : null;
+
+  if (!zone || !last) return mix;
+
+  let m = { ...mix };
+
+  // Classic high FF → breaking/offspeed down
+  if (last === "fastball" && zone.startsWith("HIGH")) {
+    m.breaking += 0.08;
+    m.change += 0.04;
+    m.fastball -= 0.08;
+  }
+
+  // Low glove-side slider → high fastball tunnel
+  if (last === "breaking" && zone === "LOW_GLOVE") {
+    m.fastball += 0.10;
+    m.breaking -= 0.05;
+  }
+
+  // Changeup low arm-side → slider/glove next
+  if (last === "change" && zone === "LOW_ARM") {
+    m.breaking += 0.08;
+    m.fastball += 0.02;
+    m.change -= 0.06;
+  }
+
+  // Down the middle heater → anything but another cookie
+  if (last === "fastball" && zone === "MID_MIDDLE") {
+    m.breaking += 0.08;
+    m.change += 0.04;
+    m.fastball -= 0.10;
+  }
+
+  return normalize(m);
+}
+
 /* -----------------------------
    ASCII STRIKE ZONE (10×10)
 ----------------------------- */
@@ -470,35 +843,166 @@ function coloredPitch(type, txt) {
   return txt;
 }
 
-function prettyPrediction(pred) {
+const CODE_LABELS = {
+  FF: "Four-Seam Fastball",
+  FA: "Four-Seam Fastball",
+  SI: "Sinker",
+  FT: "Sinker",
+  FC: "Cutter",
+  SL: "Slider",
+  CU: "Curveball",
+  KC: "Knuckle Curve",
+  KN: "Knuckleball",
+  SW: "Sweeper",
+  SV: "Sweeper",
+  CH: "Changeup",
+  SF: "Splitter",
+  FS: "Splitter",
+  FO: "Forkball",
+  SC: "Screwball",
+};
+
+function getPitchLabel(code) {
+  const c = String(code || "").toUpperCase();
+  return CODE_LABELS[c] || c || "Unknown Pitch";
+}
+
+function pickSpecificPitchCode(family, pitcherId) {
+  const famUsage = pitcherTypeUsageById[pitcherId]?.[family];
+
+  if (famUsage && Object.keys(famUsage).length > 0) {
+    let bestCode = null;
+    let bestVal = -1;
+    for (const [code, val] of Object.entries(famUsage)) {
+      if (val > bestVal) {
+        bestVal = val;
+        bestCode = code;
+      }
+    }
+    if (bestCode) return bestCode;
+  }
+
+  // Fallbacks if CSV doesn't have detail
+  if (family === "fastball") return "FF";
+  if (family === "breaking") return "SL";
+  if (family === "change") return "CH";
+  return "FF";
+}
+
+function getLikelySpecificPitch(mix, ctx) {
+  if (!mix) return null;
+
+  // pick best family
+  let bestFam = "fastball";
+  let bestVal = mix.fastball ?? 0;
+  for (const fam of ["fastball", "breaking", "change"]) {
+    if ((mix[fam] ?? 0) > bestVal) {
+      bestVal = mix[fam];
+      bestFam = fam;
+    }
+  }
+
+  const code = pickSpecificPitchCode(bestFam, ctx?.pitcherId);
+  const label = getPitchLabel(code);
+
+  // approximate probability: family share × primary type share if we have it
+  const famUsage = pitcherTypeUsageById[ctx?.pitcherId]?.[bestFam];
+  let typeShare = 1.0;
+  if (famUsage && Object.keys(famUsage).length > 0) {
+    const share = famUsage[code];
+    if (typeof share === "number" && share > 0) {
+      typeShare = share;
+    }
+  }
+  const prob = (mix[bestFam] ?? 0) * typeShare;
+
+  return {
+    family: bestFam,
+    code,
+    label,
+    probability: prob,
+  };
+}
+
+function getOptimalSpecificPitch(opt, ctx) {
+  if (!opt || !opt.mix) return null;
+  const bestFam = opt.best || "fastball";
+  const code = pickSpecificPitchCode(bestFam, ctx?.pitcherId);
+  const label = getPitchLabel(code);
+
+  const famUsage = pitcherTypeUsageById[ctx?.pitcherId]?.[bestFam];
+  let typeShare = 1.0;
+  if (famUsage && Object.keys(famUsage).length > 0) {
+    const share = famUsage[code];
+    if (typeof share === "number" && share > 0) {
+      typeShare = share;
+    }
+  }
+  const prob = (opt.mix[bestFam] ?? 0) * typeShare;
+
+  return {
+    family: bestFam,
+    code,
+    label,
+    probability: prob,
+  };
+}
+
+function prettyPrediction(pred, ctx) {
+  const spec = getLikelySpecificPitch(pred, ctx);
+
+  const lines = [
+    `${coloredPitch(
+      "fastball",
+      `Fastball: ${(pred.fastball * 100).toFixed(0)}%`
+    )}`,
+    `${coloredPitch(
+      "breaking",
+      `Breaking: ${(pred.breaking * 100).toFixed(0)}%`
+    )}`,
+    `${coloredPitch(
+      "change",
+      `Offspeed: ${(pred.change * 100).toFixed(0)}%`
+    )}`,
+  ];
+
+  let extra = "";
+  if (spec) {
+    extra = `\n        Most likely pitch: ${spec.label} (${spec.code}, ~${(
+      spec.probability * 100
+    ).toFixed(0)}%)`;
+  }
+
   return `
-        ${coloredPitch(
-          "fastball",
-          `Fastball: ${(pred.fastball * 100).toFixed(0)}%`
-        )}
-        ${coloredPitch(
-          "breaking",
-          `Breaking: ${(pred.breaking * 100).toFixed(0)}%`
-        )}
-        ${coloredPitch(
-          "change",
-          `Offspeed: ${(pred.change * 100).toFixed(0)}%`
-        )}
+        ${lines.join("\n        ")}${extra}
   `;
 }
 
-function prettyOptimal(opt) {
+function prettyOptimal(opt, ctx) {
   const mix = opt.mix;
   const best = opt.best;
-  const label =
-    best === "fastball" ? "Fastball" : best === "breaking" ? "Breaking" : "Offspeed";
+  const labelFamily =
+    best === "fastball"
+      ? "Fastball"
+      : best === "breaking"
+      ? "Breaking"
+      : "Offspeed";
+
+  const spec = getOptimalSpecificPitch(opt, ctx);
+
+  let extra = "";
+  if (spec) {
+    extra = `\n        Recommended pitch: ${spec.label} (${spec.code}, ~${(
+      spec.probability * 100
+    ).toFixed(0)}%)`;
+  }
 
   return `
-        Recommended family: ${label} (${(mix[best] * 100).toFixed(0)}%)
+        Recommended family: ${labelFamily} (${(mix[best] * 100).toFixed(0)}%)
         Full optimal mix:
         Fastball: ${(mix.fastball * 100).toFixed(0)}%
         Breaking: ${(mix.breaking * 100).toFixed(0)}%
-        Offspeed: ${(mix.change * 100).toFixed(0)}%
+        Offspeed: ${(mix.change * 100).toFixed(0)}%${extra}
   `;
 }
 
@@ -533,6 +1037,10 @@ function prettyContext(ctx) {
     ? `   Batter weakness this game: ${bvp.topWeakFamily}`
     : "   Batter weakness this game: (n/a yet)";
 
+  const locStr = ctx.lastPitchLocationLabel
+    ? `   Last pitch loc: ${ctx.lastPitchLocationLabel}`
+    : "   Last pitch loc: (n/a)";
+
   return `
    Count: ${ctx.balls}-${ctx.strikes} | Outs: ${ctx.outs} | Runners: ${prettyRunners(
     ctx.runnersOn
@@ -545,13 +1053,14 @@ ${pitcherMixStr}
 ${arsenalStr}
 ${baStr}
 ${weakStr}
+${locStr}
   `;
 }
 
 /* -----------------------------
    Sequence Analysis
 ----------------------------- */
-function analyzeSequence(newType) {
+function analyzeSequence(newType, pitch) {
   pitchSequence.push(newType);
 
   const last2 = pitchSequence.slice(-2);
@@ -862,7 +1371,8 @@ function getCountFactor(family, balls, strikes) {
 function recommendOptimalPitch(ctx) {
   // Baseline from arsenal (what he actually throws)
   let base =
-    ctx.pitcherArsenalMix || leaguePitchMixByCount[`${ctx.balls}-${ctx.strikes}`] || {
+    ctx.pitcherArsenalMix ||
+    leaguePitchMixByCount[`${ctx.balls}-${ctx.strikes}`] || {
       fastball: 0.6,
       breaking: 0.25,
       change: 0.15,
@@ -923,6 +1433,45 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
     const pitcherArsenalMix = getPitcherArsenalMix(pitcherId);
     const batterVsPitch = getBatterVsPitchProfile(batterId);
 
+    // Location zone + label
+    let lastPitchLocationZone = null;
+    let lastPitchLocationLabel = null;
+    if (
+      location &&
+      location.hasLocation &&
+      location.px != null &&
+      location.pz != null &&
+      location.szTop != null &&
+      location.szBot != null
+    ) {
+      lastPitchLocationZone = classifyLocation(
+        location.px,
+        location.pz,
+        location.szTop,
+        location.szBot
+      );
+      lastPitchLocationLabel = prettyLocationLabel(lastPitchLocationZone);
+    }
+
+    // Previous context for tunneling
+    const prev = lastCtx;
+
+    const tempCtx = {
+      lastPitchType: pitch.details?.type?.code ?? null,
+      location,
+    };
+
+    const tunnelInfo = detectTunnel(prev, tempCtx);
+
+    // Save this context for next pitch's tunnel detection
+    lastCtx = {
+      lastPitchType: tempCtx.lastPitchType,
+      location,
+    };
+
+    const lastTwoPitchTypes = pitchSequence.slice(-2);
+    const lastPitchDescription = pitch.details?.description ?? "";
+
     return {
       inning: play.about.inning,
       topBottom: play.about.halfInning === "top" ? "Top" : "Bottom",
@@ -938,6 +1487,11 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
       },
 
       lastPitchType: pitch.details?.type?.code ?? null,
+      lastPitchDescription,
+      lastTwoPitchTypes,
+      lastPitchLocationZone,
+      lastPitchLocationLabel,
+
       pitcherThrows: play.matchup.pitchHand?.code ?? "R",
       batterBats: play.matchup.batSide?.code ?? "R",
 
@@ -949,6 +1503,8 @@ function buildReplayPitchContext(game, playIdx, pitchIdx, outsBefore) {
 
       pitcherId,
       batterId,
+
+      tunnelInfo,
     };
   } catch {
     return null;
@@ -1027,6 +1583,10 @@ function predictPitchType(ctx) {
     };
   }
 
+  // Sequencing + location adjustments
+  mix = applySequencingAdjustments(mix, ctx);
+  mix = applyLocationSequencing(mix, ctx);
+
   return normalize(mix);
 }
 
@@ -1045,6 +1605,8 @@ async function handleReplayMode() {
     pitcherGameStats = {};
     batterAggressionStats = {};
     batterVsPitchStats = {};
+    pitchSequence = [];
+    lastCtx = null;
   }
 
   if (pitchPointer >= pitchIndexMap.length) {
@@ -1076,14 +1638,23 @@ async function handleReplayMode() {
     }
   }
 
-  const ctx = buildReplayPitchContext(lastGameData, playIdx, pitchIdx, outsBefore);
+  const code = pitch.details?.type?.code ?? null;
+  let seqNote = null;
+  if (code) {
+    seqNote = analyzeSequence(code, pitch);
+  }
+
+  const ctx = buildReplayPitchContext(
+    lastGameData,
+    playIdx,
+    pitchIdx,
+    outsBefore
+  );
   const likelyMix = predictPitchType(ctx);
   const optimal = recommendOptimalPitch(ctx);
 
   const mph =
-    pitch.pitchData?.startSpeed ??
-    pitch.details?.startSpeed ??
-    null;
+    pitch.pitchData?.startSpeed ?? pitch.details?.startSpeed ?? null;
 
   console.log(
     colors.bold +
@@ -1100,24 +1671,37 @@ async function handleReplayMode() {
   const changes = detectChanges(play);
   if (changes) console.log(colors.cyan + changes + colors.reset);
 
-  if (ctx?.lastPitchType) {
-    const seq = analyzeSequence(ctx.lastPitchType);
-    if (seq) console.log(colors.yellow + seq + colors.reset);
-  }
+  if (seqNote) console.log(colors.yellow + seqNote + colors.reset);
 
   if (ctx) console.log(prettyContext(ctx));
 
-  console.log(colors.green + "   ➤ Expected Next Pitch (Likely):" + colors.reset);
-  console.log(prettyPrediction(likelyMix));
+  console.log(
+    colors.green + "   ➤ Expected Next Pitch (Likely):" + colors.reset
+  );
+  console.log(prettyPrediction(likelyMix, ctx));
 
-  console.log(colors.magenta + "   ➤ Recommended Pitch (Optimal):" + colors.reset);
-  console.log(prettyOptimal(optimal));
+  console.log(
+    colors.magenta + "   ➤ Recommended Pitch (Optimal):" + colors.reset
+  );
+  console.log(prettyOptimal(optimal, ctx));
 
-  console.log(colors.blue + "\nASCII Strike Zone / Movement:\n" + colors.reset);
+  console.log(
+    colors.blue + "\nASCII Strike Zone / Movement:\n" + colors.reset
+  );
   console.log(asciiStrikeZone(ctx?.location));
 
+  if (ctx?.tunnelInfo) {
+    console.log(
+      colors.magenta +
+        `🔥 ${ctx.tunnelInfo.label} (ΔBreak: ${ctx.tunnelInfo.totalBreakDiff.toFixed(
+          1
+        )}")` +
+        colors.reset
+    );
+  }
+
   // Update context stats AFTER using them (info available at “decision time”)
-  const bucket = mapPitchCodeToBucket(pitch.details?.type?.code);
+  const bucket = mapPitchCodeToBucket(code);
   updatePitcherStats(play, pitch);
   updateBatterStats(play, pitch);
   updateBatterVsPitchStats(play, pitch, bucket, isLastPitch);
@@ -1203,7 +1787,16 @@ app.get("/api/pitch-type", (req, res) => {
   const likely = predictPitchType(ctx);
   const optimal = recommendOptimalPitch(ctx);
 
-  res.json({ context: ctx, likely, optimal });
+  const likelySpecific = getLikelySpecificPitch(likely, ctx);
+  const optimalSpecific = getOptimalSpecificPitch(optimal, ctx);
+
+  res.json({
+    context: ctx,
+    likely,
+    likelySpecific,
+    optimal,
+    optimalSpecific,
+  });
 });
 
 app.get("/api/arsenal/:pid", (req, res) => {
@@ -1231,6 +1824,7 @@ app.get("/api/arsenal/:pid", (req, res) => {
       breaking: data.breaking,
       offspeed: data.change,
     },
+    types: pitcherTypeUsageById[pid] || null,
   });
 });
 
